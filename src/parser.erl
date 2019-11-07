@@ -76,11 +76,21 @@ parse_midi_chunks(<<BinaryData/binary>>) ->
     <<"MTrk", Size:32/integer, Data:Size/binary, Rest/binary>> = BinaryData,
     case parse_midi_chunks(Rest) of
         {ok} -> [{mtrk, {size, Size}, parse_chunk_events(Data, unknown)}];
+        ok -> [{mtrk, {size, Size}, parse_chunk_events(Data, unknown)}];
         ParsedData -> [{mtrk, {size, Size}, parse_chunk_events(Data, unknown)} | ParsedData]
     end.
 
 % http://www.onicos.com/staff/iz/formats/midi-event.html
 % http://midi.teragonaudio.com/tech/midispec/run.htm
+% http://www.music-software-development.com/midi-tutorial.html
+% https://stackoverflow.com/questions/46702181/how-differentiate-deltatime-vlq-from-running-status-midi-specification
+% https://www.midi.org/specifications/item/table-3-control-change-messages-data-bytes-2
+% https://www.noterepeat.com/articles/how-to/213-midi-basics-common-terms-explained
+% http://www.personal.kent.edu/~sbirch/Music_Production/MP-II/MIDI/midi_control_change_messages.htm
+% http://www.somascape.org/midi/basic/intro.html#midifiles
+% http://www.music.mcgill.ca/~ich/classes/mumt306/StandardMIDIfileformat.html
+% https://samesound.ru/p/midiwork/70572-midi-messages-explain
+% http://www.songstuff.com/recording/article/midi_message_format/
 
 parse_chunk_events(<<Chunk/binary>>, PrevStatus) ->
     % <MTrk event> = <delta-time> <event>
@@ -89,157 +99,45 @@ parse_chunk_events(<<Chunk/binary>>, PrevStatus) ->
 
     {{delta_time, DeltaTime}, Tail} = extract_delta_time(Chunk),
 
-    case Tail of
+    {Status, StatusBodyAndRest} = events:parse_status_bytes(Tail),
 
-        % FF 58 04 nn dd cc bb -> Time Signature
-        <<16#ff, 16#58, 16#04, Nn:8, Dd:8, Cc:8, Bb:8, Rest/binary>> ->
-            [{time_signature, {delta_time, DeltaTime}, Nn, Dd, Cc, Bb} | parse_chunk_events(Rest, time_signature)];
+    case Status of
+        unknown ->
+            % parse structure of prev data
+            CurrentStatus = PrevStatus,
 
-        % FF 59 02 sf mi -> Key Signature
-        <<16#ff, 16#59, 16#02, Sf:8, Mi:8, Rest/binary>> ->
-            [{key_signature, {delta_time, DeltaTime}, Sf, Mi} | parse_chunk_events(Rest, key_signature)];
+            NeedAddPrefix = lists:member(CurrentStatus, [note_off,
+                                                         note_on,
+                                                         program_change_event,
+                                                         control_change_event,
+                                                         note_aftertouch,
+                                                         channel_aftertouch,
+                                                         pitch_bend]),
+            if
+                NeedAddPrefix ->
+                    {StatusData, Rest} = events:parse_status_data({CurrentStatus, <<0:1, 0:1, 0:1, 0:1, StatusBodyAndRest/bitstring>>});
+                true ->
+                    {StatusData, Rest} = events:parse_status_data({CurrentStatus, <<StatusBodyAndRest/bitstring>>})
+            end,
 
-        % FF 54 05 hr mn se fr ff ->SMPTE Offset
-        <<16#ff, 16#54, 16#05, Hr:8, Mn:8, Se:8, Fr:8, Ff:8, Rest/binary>> ->
-            [{smtpe_offset, {delta_time, DeltaTime}, Hr, Mn, Se, Fr, Ff} | parse_chunk_events(Rest, smtpe_offset)];
+            [{CurrentStatus, {delta_time, DeltaTime}, StatusData} | parse_chunk_events(Rest, CurrentStatus)];
 
-        % FF 51 03 tttttt ->  Set Tempo, in microseconds per MIDI quarter-note
-        <<16#ff, 16#51, 16#03, Tt:24, Rest/binary>> ->
-            [{tempo, {delta_time, DeltaTime}, Tt} | parse_chunk_events(Rest, tempo)];
-
-        % FF 7F len data -> Sequencer-Specific Meta-Event
-        <<16#ff, 16#7f, Size:8/integer, Data:Size/binary, Rest/binary>> ->
-            [{sequencer_specific, {delta_time, DeltaTime}, Data} | parse_chunk_events(Rest, sequencer_specific)];
-
-        % FF 2F 00 -> End of Track
-        <<16#ff, 16#2f, 0>> ->
-            {end_of_chunk, {delta_time, DeltaTime}};
-
-        % FF 20 01 cc -> MIDI Channel Prefix
-        <<16#ff, 16#20, 16#01, Cc:8, Rest/binary>> ->
-            [{channel, {delta_time, DeltaTime}, Cc} | parse_chunk_events(Rest, channel)];
-
-        % FF 00 02 ssss -> Sequence Number
-        <<16#ff, 16#00, 16#02, Ss:8, Rest/binary>> ->
-            [{sequence_number, {delta_time, DeltaTime}, Ss} | parse_chunk_events(Rest, sequence_number)];
-
-        % FF 01 len text -> Text Event
-        <<16#ff, 16#01, Size:8/integer, Text:Size/binary, Rest/binary>> ->
-            [{text_event, {delta_time, DeltaTime}, Text} | parse_chunk_events(Rest, text_event)];
-
-        % FF 02 len text -> Copyright Notice
-        <<16#ff, 16#02, Size:8/integer, Text:Size/binary, Rest/binary>> ->
-            [{copyright, {delta_time, DeltaTime}, Text} | parse_chunk_events(Rest, copyright)];
-
-        % FF 03 len text -> Sequence/Track Name
-        <<16#ff, 16#03, Size:8/integer, Text:Size/binary, Rest/binary>> ->
-            [{sequence_or_track_name, {delta_time, DeltaTime}, Text} | parse_chunk_events(Rest, sequence_or_track_name)];
-
-        % FF 04 len text -> Instrument Name
-        <<16#ff, 16#04, Size:8/integer, Text:Size/binary, Rest/binary>> ->
-            [{instrument_name, {delta_time, DeltaTime}, Text} | parse_chunk_events(Rest, instrument_name)];
-
-        % FF 05 len text -> Lyric
-        <<16#ff, 16#05, Size:8/integer, Text:Size/binary, Rest/binary>> ->
-            [{lyric, {delta_time, DeltaTime}, Text} | parse_chunk_events(Rest, lyric)];
-
-        % FF 06 len text -> Marker
-        <<16#ff, 16#06, Size:8/integer, Text:Size/binary, Rest/binary>> ->
-            [{marker, {delta_time, DeltaTime}, Text} | parse_chunk_events(Rest, marker)];
-
-        % FF 07 len text -> cue point
-        <<16#ff, 16#07, Size:8/integer, Text:Size/binary, Rest/binary>> ->
-            [{cue_point, {delta_time, DeltaTime}, Text} | parse_chunk_events(Rest, cue_point)];
-
-        % parse SysEx events
-        % F0 <length> <bytes to be transmitted after F0>
-        <<16#f0, Size:8/integer, Data:Size/integer, Rest/binary>> ->
-            [{sys_ex, {delta_time, DeltaTime}, Data} | parse_chunk_events(Rest, sys_ex)];
-
-        % F7 <length> <all bytes to be transmitted>
-        % F7 <length> <all bytes to be transmitted F7>
-        <<16#f7, Size:8/integer, Data:Size/integer, Rest/binary>> ->
-            [{sys_ex, {delta_time, DeltaTime}, Data} | parse_chunk_events(Rest, sys_ex)];
-
-        % Note Off Event
-        % Note Off	MIDI Channel	Note Number	Velocity
-        % 8 (0x8)	0-15	0-127	0-127
-        % 1000nnnn
-        <<1:1, 0:1, 0:1, 0:1, Channel:4/integer, NoteNumber:8/integer, Velocity:8/integer, Rest/binary>> ->
-            [{note_off, {delta_time, DeltaTime}, {channel, Channel}, {note, NoteNumber}, {velocity, Velocity}} | parse_chunk_events(Rest, note_off)];
-
-        % TODO: parse VLQ
-        % Note On Event
-        % Note On	MIDI Channel	Note Number	Velocity
-        % 9 (0x9)	0-15	0-127	0-127
-        % 1001nnnn
-        % Note On (a velocity of 0 = Note Off)
-        <<1:1, 0:1, 0:1, 1:1, Channel:4/integer, NoteNumber:8/integer, Velocity:8/integer, Rest/binary>> ->
-            [{note_on, {delta_time, DeltaTime}, {channel, Channel}, {note, NoteNumber}, {velocity, Velocity}} | parse_chunk_events(Rest, note_on)];
-
-
-        % Program Change Event
-        % Program Change CnH
-        % Program Change	MIDI Channel	Program Number
-        % 12 (0xC)	0-15	0-127
-        % 1100nnnn
-        <<1:1, 1:1, 0:1, 0:1, Channel:4/integer, Program:8/integer, Rest/binary>> ->
-            [{program_change_event, {delta_time, DeltaTime}, {channel, Channel}, Program} | parse_chunk_events(Rest, program_change_event)];
-
-        %% Control Change BnH (0 - 119)
-        % Controller	MIDI Channel	Controller Type	Value
-        % 11 (0xB)	0-15	0-127	0-127
-        % 1011nnnn
-        <<1:1, 0:1, 1:1, 1:1, Channel:4/integer, ControllerType:8/integer, Value:8/integer, Rest/binary>> ->
-            [{control_change_event, {delta_time, DeltaTime}, {channel, Channel}, ControllerType, Value} | parse_chunk_events(Rest, control_change_event)];
-
-        % Note Aftertouch Event
-        % Note Aftertouch	MIDI Channel	Note Number	Amount
-        % 10 (0xA)	0-15	0-127	0-127
-        % 1010nnnn
-        <<1:1, 0:1, 1:1, 0:1, Channel:4/integer, NoteNumber:8/integer, Amount:8/integer, Rest/binary>> ->
-            [{note_aftertouch, {delta_time, DeltaTime}, {channel, Channel}, NoteNumber, Amount} | parse_chunk_events(Rest, note_aftertouch)];
-
-        % Channel Aftertouch Event
-        % Channel Aftertouch	MIDI Channel	Amount
-        % 13 (0xD)	0-15	0-127
-        % 1101nnnn
-        <<1:1, 1:1, 0:1, 1:1, Channel:4/integer, Amount:8/integer, Rest/binary>> ->
-            [{channel_aftertouch, {delta_time, DeltaTime}, {channel, Channel}, Amount} | parse_chunk_events(Rest, channel_aftertouch)];
-
-        % Pitch Bend Event
-        % Pitch Bend	MIDI Channel
-        % 14 (0xE)	0-15	0-127	0-127
-        % 1110nnnn
-        <<1:1, 1:1, 1:1, 0:1, Channel:4/integer, ValueLSP:8/integer, ValueMSB:8/integer, Rest/binary>> ->
-            [{pitch_bend, {delta_time, DeltaTime}, {channel, Channel}, ValueLSP, ValueMSB} | parse_chunk_events(Rest, pitch_bend)];
-
-        %% <<16#20, UnknownByte:8, Rest/binary>> ->
-        %%     %<<B:128/binary, _/binary>> = Chunk,
-        %%     %io:format("Unknown chunk format: ~p~n", [B]),
-        %%     %{{delta_time, DeltaTime}, B};
-        %%     io:format("Unknown bytes: ~p~n", [UnknownByte]),
-        %%     [{{unknown, 16#20}, {delta_time, DeltaTime}, <<UnknownByte:8/integer>>} | parse_chunk_events(Rest)];
-        %% <<16#32, UnknownByte:8, Rest/binary>> ->
-        %%     io:format("Unknown bytes: ~p~n", [UnknownByte]),
-        %%     [{{unknown, 16#32}, {delta_time, DeltaTime}, <<UnknownByte:8/integer>>} | parse_chunk_events(Rest)];
-
-        % match running status messages
-        % TODO: rewrite
-        <<UnknownStatus:8, UnknownStatusData:8, Rest/binary>> ->
-            io:format("Unknown bytes: ~p ~p ~n", [UnknownStatus, UnknownStatusData]),
-            [{PrevStatus, {delta_time, DeltaTime}, UnknownStatus, UnknownStatusData} | parse_chunk_events(Rest, unknown)];
-
-        <<B:128/binary, _/binary>> ->
-            io:format("Unknown chunk format: ~p~n", [{{delta_time, DeltaTime}, B}]),
-            {{delta_time, DeltaTime}, B};
+        end_of_chunk ->
+            {Status, {delta_time, DeltaTime}};
         _ ->
-            io:format("Unknown chunk format: ~p~n", [Chunk])
+            % use current status structure
+            CurrentStatus = Status,
+
+            {StatusData, Rest} = events:parse_status_data({CurrentStatus, StatusBodyAndRest}),
+
+            [{CurrentStatus, {delta_time, DeltaTime}, StatusData} | parse_chunk_events(Rest, CurrentStatus)]
     end.
 
 
 % Match 1-4-bytes vlq
 extract_delta_time(<<BinaryData/binary>>) ->
+    % io:format("Extract delta time ~p ~n", [BinaryData]),
+
     case BinaryData of
         <<16#00, Rest/binary>> ->
             {{delta_time, 0}, Rest};
